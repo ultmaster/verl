@@ -30,6 +30,10 @@ from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.executor.abstract import Executor
 from vllm.worker.worker_base import WorkerWrapperBase
 
+from agentlightning.instrumentation.vllm import instrument_vllm
+
+instrument_vllm()
+
 from verl.utils.fs import copy_to_local
 from verl.workers.rollout.async_server import AsyncServerBase
 
@@ -171,7 +175,7 @@ class AsyncvLLMServer(AsyncServerBase):
             enforce_eager=config.enforce_eager,
             gpu_memory_utilization=config.gpu_memory_utilization,
             disable_custom_all_reduce=True,
-            disable_mm_preprocessor_cache=True,
+            # disable_mm_preprocessor_cache=True,  # no need for v0.9.0
             skip_tokenizer_init=False,
             max_model_len=max_model_len,
             load_format="auto",
@@ -201,6 +205,9 @@ class AsyncvLLMServer(AsyncServerBase):
             request_logger=RequestLogger(max_log_len=4096),
             chat_template=None,
             chat_template_content_format="auto",
+            # new for auto tool
+            enable_auto_tools=True,
+            tool_parser="hermes",
         )
 
     async def chat_completion(self, raw_request: Request):
@@ -217,7 +224,8 @@ class AsyncvLLMServer(AsyncServerBase):
         if request.stream:
             return StreamingResponse(content=generator, media_type="text/event-stream")
         else:
-            assert isinstance(generator, ChatCompletionResponse)
+            # hide because of patch
+            # assert isinstance(generator, ChatCompletionResponsePatched)
             return JSONResponse(content=generator.model_dump())
 
     async def chat_completion_generator(self, request: ChatCompletionRequest) -> AsyncGenerator[Tuple[int, str]]:
@@ -238,7 +246,8 @@ class AsyncvLLMServer(AsyncServerBase):
             async for chunk in generator:
                 yield 200, chunk
         else:
-            assert isinstance(generator, ChatCompletionResponse)
+            # hide because of patch
+            # assert isinstance(generator, ChatCompletionResponsePatched)
             data = generator.model_dump_json(exclude_unset=True)
             yield 200, f"data: {data}\n\n"
 

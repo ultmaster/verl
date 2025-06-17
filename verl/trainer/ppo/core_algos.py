@@ -109,6 +109,53 @@ def compute_gae_advantage_return(
     return advantages, returns
 
 
+
+def compute_hier_grpo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    data_id_list: np.ndarray,
+    rollout_id_list: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+):
+    scores = token_level_rewards.sum(dim=-1)
+
+    data_id2score = defaultdict(list)
+    data_id2mean = {}
+    data_id2std = {}
+
+    data_rollout_id2score = defaultdict(list)
+    data_rollout_id2mean = {}
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            # these values should be the same in our setting
+            # we do an average here in case they are not the same
+            data_rollout_id2score[(data_id_list[i], rollout_id_list[i])].append(scores[i])
+        for data_id, rollout_id in data_rollout_id2score:
+            data_rollout_id2mean[(data_id, rollout_id)] = torch.mean(torch.tensor(data_rollout_id2score[(data_id, rollout_id)]))
+        # calculate mean for data_id
+        for data_id, rollout_id in data_rollout_id2mean:
+            data_id2score[data_id].append(data_rollout_id2mean[(data_id, rollout_id)])
+        for data_id in data_id2score:
+            if len(data_id2score[data_id]) == 1:
+                data_id2mean[data_id] = torch.tensor(0.0)
+                data_id2std[data_id] = torch.tensor(1.0)
+            elif len(data_id2score[data_id]) > 1:
+                data_id2mean[data_id] = torch.mean(torch.tensor(data_id2score[data_id]))
+                data_id2std[data_id] = torch.std(torch.tensor([data_id2score[data_id]]))
+            else:
+                raise ValueError(f"no score in prompt index: {data_id}")
+        for i in range(bsz):
+            if norm_adv_by_std_in_grpo:
+                scores[i] = (scores[i] - data_id2mean[data_id_list[i]]) / (data_id2std[data_id_list[i]] + epsilon)
+            else:
+                scores[i] = scores[i] - data_id2mean[data_id_list[i]]
+        scores = scores.unsqueeze(-1) * response_mask
+    return scores, scores
+
+
 # NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
 def compute_grpo_outcome_advantage(
     token_level_rewards: torch.Tensor,
