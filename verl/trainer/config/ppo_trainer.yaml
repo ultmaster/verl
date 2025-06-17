@@ -1,3 +1,7 @@
+agent_mode:
+  enable: False
+  server_port: 9999
+
 data:
   tokenizer: null
   train_files: ~/data/rlhf/gsm8k/train.parquet
