@@ -18,8 +18,13 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import asyncio
+import copy
 import json
 import os
+import random
+import threading
+import time
 import uuid
 from collections import defaultdict
 from contextlib import contextmanager
@@ -27,13 +32,17 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
-from typing import Dict, Optional, Type
+from typing import Dict, List, Optional, Type
 
 import numpy as np
 import ray
+import requests
 import torch
+from agentlightning import LLM, AgentLightningServer, NamedResources, Rollout
 from codetiming import Timer
+from flask import Flask, Response, abort, jsonify, request
 from omegaconf import OmegaConf, open_dict
+from tensordict import TensorDict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
@@ -60,15 +69,6 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
-import threading
-from flask import Flask, request, Response, abort, jsonify
-import requests
-import random
-import uuid
-import time
-import copy
-from tensordict import TensorDict
-from typing import List
 
 WorkerType = Type[Worker]
 
@@ -286,13 +286,9 @@ def _timer(name: str, timing_raw: Dict[str, float]):
     timing_raw[name] += timer.last
 
 
-def get_left_padded_ids_and_attention_mask(
-    ids: List[int],
-    max_length: int,
-    pad_token_id: int
-):
+def get_left_padded_ids_and_attention_mask(ids: List[int], max_length: int, pad_token_id: int):
     """
-    Left-pad (or truncate) a sequence of token IDs to a fixed length, 
+    Left-pad (or truncate) a sequence of token IDs to a fixed length,
     and build the corresponding attention mask.
 
     Args:
@@ -318,11 +314,8 @@ def get_left_padded_ids_and_attention_mask(
     attention_mask = [0] * pad_len + [1] * seq_len
     return padded_ids, attention_mask
 
-def get_right_padded_ids_and_attention_mask(
-    ids: List[int],
-    max_length: int,
-    pad_token_id: int
-):
+
+def get_right_padded_ids_and_attention_mask(ids: List[int], max_length: int, pad_token_id: int):
     """
     Right-pad (or truncate) a sequence of token IDs to a fixed length,
     and build the corresponding attention mask.
@@ -351,142 +344,170 @@ def get_right_padded_ids_and_attention_mask(
     return padded_ids, attention_mask
 
 
-class AgentModeDaemon(object):
+class AgentModeDaemon:
+    """
+    AgentModeDaemon using the AgentLightningServer SDK.
+
+    This class manages the server lifecycle, task queueing, and results
+    retrieval, while also running a proxy server for LLM requests. It maintains
+    the original interface for compatibility with the RayPPOTrainer.
+    """
 
     def __init__(self, port, train_rollout_n, train_information, mini_batch_size, pad_token_id):
-        self.port = port
-        self.timeout_seconds = 180
-        self.available_server_addresses = []
-        self.n_sample = None
-        self.picked_id_set = set()
-        self.picked_id_to_ts = {}
-        self.unfinished_id_to_sample_info = {}
-        self.finished_id_to_sample_info = {}
-        self.train_information = train_information
-        # train_rollout_n only work for training
+        # Server and Task Configuration
+        self.server_port = port
+        self.task_timeout_seconds = 180
+        self.server = AgentLightningServer(host="0.0.0.0", port=self.server_port, task_timeout_seconds=self.task_timeout_seconds)
+        self.proxy_port = port + 1  # Run proxy on a different port
+
+        # Training and Data Configuration
         self.train_rollout_n = train_rollout_n
+        self.train_information = train_information
         self.mini_batch_size = mini_batch_size
         self.pad_token_id = pad_token_id
+
+        # Internal State
+        self.backend_llm_server_addresses: List[str] = []
+        self._total_tasks_queued = 0
+        self._completed_rollouts: Dict[str, Rollout] = {}
+        self._task_id_to_original_sample: Dict[str, Dict] = {}
+        self._server_thread: Optional[threading.Thread] = None
+        self._proxy_thread: Optional[threading.Thread] = None
         self.is_train = True
-        self.lock = threading.Lock()
+
+    def _start_proxy_server(self):
+        """
+        Initializes and runs a Flask-based proxy server in a separate thread.
+        This proxy load-balances requests to the actual backend LLM servers.
+        """
+        app = Flask(__name__)
+
+        @app.route("/v1/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+        def proxy(path):
+            if not self.backend_llm_server_addresses:
+                abort(503, description="No backend LLM servers available.")
+
+            # Randomly choose a backend server for load balancing
+            target_server = random.choice(self.backend_llm_server_addresses)
+            target_url = f"http://{target_server}/v1/{path}"
+
+            # Copy client request headers, removing the Host header
+            headers = {key: value for key, value in request.headers if key.lower() != "host"}
+
+            try:
+                # Forward the request to the target backend
+                resp = requests.request(
+                    method=request.method,
+                    url=target_url,
+                    headers=headers,
+                    params=request.args,
+                    data=request.get_data(),
+                    cookies=request.cookies,
+                    allow_redirects=False,
+                    timeout=self.task_timeout_seconds,
+                )
+                # Filter out hop-by-hop headers before returning the response
+                excluded_headers = ["content-encoding", "content-length", "transfer-encoding", "connection"]
+                response_headers = [(name, value) for name, value in resp.raw.headers.items() if name.lower() not in excluded_headers]
+                return Response(resp.content, resp.status_code, response_headers)
+            except requests.exceptions.RequestException as e:
+                abort(500, description=f"Error proxying request: {e}")
+
+        def run_app():
+            app.run(host="0.0.0.0", port=self.proxy_port, threaded=True)
+
+        self._proxy_thread = threading.Thread(target=run_app, daemon=True)
+        self._proxy_thread.start()
+        print(f"Proxy server running on port {self.proxy_port}")
+
+    def start(self):
+        """Starts the main AgentLightningServer and the proxy server."""
+
+        asyncio.run(self.server.start())
+        self._start_proxy_server()
+
+        print(f"AgentLightningServer control plane running on port {self.server_port}")
+
+    async def _async_set_up(self, data, server_addresses, is_train=True):
+        """Async helper to set up data and resources on the server."""
+        self.clear_data_and_server()
+        self.backend_llm_server_addresses = server_addresses
+        self.is_train = is_train
+
+        # 1. Update resources on the server for clients to use
+        llm_resource = LLM(
+            endpoint=f"http://127.0.0.1:{self.proxy_port}",
+            model=self.train_information.get("model", "default-model"),
+            sampling_parameters={"temperature": self.train_information.get("temperature", 0.7)},
+        )
+        resources: NamedResources = {"main_llm": llm_resource}
+        resources_id = await self.server.update_resources(resources)
+
+        # 2. Queue tasks for agents to process
+        keys = list(data.keys())
+        num_samples = len(data[keys[0]])
+        rollouts_per_sample = self.train_rollout_n if is_train else 1
+
+        for i in range(num_samples):
+            data_id = str(uuid.uuid4())
+            original_sample = {key: data[key][i] for key in keys}
+            original_sample["data_id"] = data_id
+
+            # For training, each sample is rolled out multiple times
+            for j in range(rollouts_per_sample):
+                task_metadata = {"data_id": data_id, "is_train": is_train}
+                # The core data for the agent to work on
+                task_input_sample = {"prompt": original_sample.get("raw_prompt")}
+
+                rollout_id = await self.server.queue_task(sample=task_input_sample, mode="train" if is_train else "val", resources_id=resources_id, metadata=task_metadata)
+                # Store original sample data to reconstruct batch information later
+                self._task_id_to_original_sample[rollout_id] = original_sample
+                self._total_tasks_queued += 1
 
     def set_up_data_and_server(self, data, server_addresses, is_train=True):
-        keys = data.keys()
-        self.n_sample = len(data[list(keys)[0]])
-        self.finished_id_to_sample_info = {}
-        self.unfinished_id_to_sample_info = {}
-        self.picked_id_set = set()
-        self.picked_id_to_ts = {}
-        self.available_server_addresses = server_addresses
-        self.is_train = is_train
-        if is_train is True:
-            # for training, rollout should happen for self.train_rollout_n times for every sample
-            for i in range(self.n_sample):
-                data_id = str(uuid.uuid4())
-                for j in range(self.train_rollout_n):
-                    sample_info = {}
-                    sample_info["data_id"] = data_id
-                    rollout_id = str(uuid.uuid4())
-                    sample_info["rollout_id"] = rollout_id
-                    sample_info["is_train"] = True
-                    for key in keys:
-                        sample_info[key] = data[key][i]
-                    self.unfinished_id_to_sample_info[rollout_id] = sample_info
-        else:
-            # For testing, currently, one sample will only be evaluated for once
-            for i in range(self.n_sample):
-                data_id = str(uuid.uuid4())
-                sample_info = {}
-                sample_info["data_id"] = data_id
-                rollout_id = str(uuid.uuid4())
-                sample_info["rollout_id"] = rollout_id
-                sample_info["is_train"] = False
-                for key in keys:
-                    sample_info[key] = data[key][i]
-                self.unfinished_id_to_sample_info[rollout_id] = sample_info
+        """Synchronous wrapper for setting up data and server resources."""
+        asyncio.run(self._async_set_up(data, server_addresses, is_train))
 
-    def is_finished(self, verbose=False):
-        if len(self.unfinished_id_to_sample_info) > 0:
+    async def _async_run_until_finished(self, verbose=False):
+        """Async helper to wait for all tasks to complete."""
+        while len(self._completed_rollouts) < self._total_tasks_queued:
+            # Periodically retrieve completed rollouts from the server
+            completed_batch = await self.server.retrieve_completed_rollouts()
+            for rollout in completed_batch:
+                self._completed_rollouts[rollout.rollout_id] = rollout
+
             if verbose:
-                print("Unfinished number {} .....".format(len(self.unfinished_id_to_sample_info)))
-            return False
-        else:
-            if self.is_train:
-                assert self.n_sample * self.train_rollout_n == len(self.finished_id_to_sample_info)
-            else:
-                assert self.n_sample == len(self.finished_id_to_sample_info)
-            return True
+                print(f"Completed {len(self._completed_rollouts)}/{self._total_tasks_queued} tasks...")
 
-    def clear_data_and_server(self):
-        self.available_server_addresses = []
-        self.n_sample = None
-        self.unfinished_id_to_sample_info = {}
-        self.finished_id_to_sample_info = {}
-        self.picked_id_set = set()
-        self.picked_id_to_ts = {}
-        self.is_train = True
+            await asyncio.sleep(5)
+        print("All tasks finished.")
 
-    def reset_timeout_task(self):
-        # check if there's any picked sample, but not finished on time
-        with self.lock:
-            cur_ts = time.time()
-            ids_to_remove = []
-            for rollout_id, picked_ts in self.picked_id_to_ts.items():
-                if rollout_id not in self.finished_id_to_sample_info and cur_ts - picked_ts > self.timeout_seconds:
-                    ids_to_remove.append(rollout_id)
-            for rollout_id in ids_to_remove:
-                del self.picked_id_to_ts[rollout_id]
-                self.picked_id_set.remove(rollout_id)
-
-    def pick_one_sample(self):
-        # return None if not available
-        if len(self.unfinished_id_to_sample_info) == 0:
-            return None
-        # ensure concurrency
-        with self.lock:
-            for rollout_id, sample in self.unfinished_id_to_sample_info.items():
-                if rollout_id not in self.picked_id_set:
-                    # ok, we can pick this
-                    self.picked_id_set.add(rollout_id)
-                    self.picked_id_to_ts[rollout_id] = time.time()
-                    # picked
-                    return sample
-        return None
-
-    def report_one_sample(self, rollout_id, reward, trace_list):
-        # trace_list [{"prompt_ids": <prompt_ids>, "response_ids": <response_ids>}]
-        with self.lock:
-            if rollout_id not in self.unfinished_id_to_sample_info:
-                print("warning, this rollout_id is not in this batch! rollout_id:", rollout_id)
-                return
-            sample_info = self.unfinished_id_to_sample_info[rollout_id]
-            del self.unfinished_id_to_sample_info[rollout_id]
-            sample_info['reward'] = reward
-            sample_info['trace_list'] = trace_list
-            self.finished_id_to_sample_info[rollout_id] = sample_info
-
-    def run_until_all_finished(self):
-        while True:
-            self.reset_timeout_task()
-            if self.is_finished(verbose=True):
-                break
-            time.sleep(5)
+    def run_until_all_finished(self, verbose=True):
+        """Synchronously waits for all queued tasks to be completed and reported."""
+        if self._total_tasks_queued == 0:
+            print("Warning: No tasks were queued.")
+            return
+        asyncio.run(self._async_run_until_finished(verbose))
 
     def get_test_metrics(self):
-        assert self.is_train is False
-        assert self.n_sample == len(self.finished_id_to_sample_info)
+        """Calculates and returns metrics for a validation run."""
+        assert not self.is_train, "This method should only be called during validation."
+        assert len(self._completed_rollouts) == self._total_tasks_queued
 
         sample_stat_list = []
-        for rollout_id, sample_info in self.finished_id_to_sample_info.items():
-            trace_list = sample_info["trace_list"]
-            reward = sample_info["reward"]
-            response_length_list = [len(trace["response_ids"]) for trace in trace_list]
-            sample_stat_list.append({
-                "sum_response_length": np.sum(response_length_list),
-                "mean_response_length": np.mean(response_length_list),
-                "turn_count": len(trace_list),
-                "reward": reward
-            })
+        for rollout_id, rollout in self._completed_rollouts.items():
+            if not rollout.triplets:
+                continue
+            response_length_list = [len(triplet.response.get("response_ids", [])) for triplet in rollout.triplets]
+            sample_stat_list.append(
+                {
+                    "sum_response_length": np.sum(response_length_list),
+                    "mean_response_length": np.mean(response_length_list) if response_length_list else 0,
+                    "turn_count": len(rollout.triplets),
+                    "reward": rollout.final_reward,
+                }
+            )
+
         return {
             "val/reward": np.mean([stat["reward"] for stat in sample_stat_list]),
             "val/mean_response_length": np.mean([stat["mean_response_length"] for stat in sample_stat_list]),
@@ -494,60 +515,78 @@ class AgentModeDaemon(object):
             "val/turn_count": np.mean([stat["turn_count"] for stat in sample_stat_list]),
         }
 
-
     def get_train_data_batch(self, max_prompt_length, max_response_length, device):
-        # 获取所有的已经 report 的数据
-        # prompt_ids 是 left pad，如果 prompt_ids 超出
-        # response_ids 是 right pad
-        # 中间拼接
-        # 丢弃处理：
-        #    超过 max_prompt_length 的会被 mark 为丢弃，但在这里不丢，只是截断标记一下，后面再丢，这是为了计算 advantage 的正确性
-        #   包括 ppo mini batch 的丢弃也要这样处理
-        assert self.is_train is True
-        assert self.n_sample * self.train_rollout_n == len(self.finished_id_to_sample_info)
-        input_ids_list = []
-        input_attention_mask_list = []
-        response_ids_list = []
-        response_attention_mask_list = []
-        reward_list = []
-        data_id_list = []
-        rollout_id_list = []
-        turn_index_list = []
-        is_drop_list = []
+        """
+        Processes completed rollouts to generate a training data batch.
+
+        This function reconstructs the logic from the original AgentModeDaemon,
+        using data retrieved from the new server architecture. It handles padding,
+        truncation, and tensor creation for the PPO training loop.
+        """
+        assert self.is_train, "This method should only be called during training."
+        assert len(self._completed_rollouts) == self._total_tasks_queued
+
+        # 1. Reconstruct the `finished_id_to_sample_info` structure from completed rollouts
+        finished_id_to_sample_info = {}
+        for rollout_id, rollout in self._completed_rollouts.items():
+            original_sample = self._task_id_to_original_sample[rollout_id]
+
+            if not rollout.triplets:
+                continue
+
+            # The client should report triplets that contain prompt_ids and response_ids.
+            # Example triplet.prompt: {"token_ids": [...]}
+            # Example triplet.response: {"token_ids": [...]}
+            trace_list = [{"prompt_ids": t.prompt.get("token_ids", []), "response_ids": t.response.get("token_ids", [])} for t in rollout.triplets]
+
+            info = {
+                "reward": rollout.final_reward,
+                "trace_list": trace_list,
+                "data_id": original_sample["data_id"],
+            }
+            finished_id_to_sample_info[rollout_id] = info
+        #
+        # --- Data processing and tensor creation logic ---
+        # Get all the reported data.
+        # prompt_ids are left-padded.
+        # response_ids are right-padded.
+        # They are concatenated in the middle.
+        # Discard handling:
+        #   - Those exceeding max_prompt_length will be marked for discard, but not
+        #     discarded here. They are only truncated and marked, to be discarded later.
+        #     This is for the correctness of the advantage calculation.
+        #   - The discard for the PPO mini-batch should also be handled this way.
+        input_ids_list, input_attention_mask_list = [], []
+        response_ids_list, response_attention_mask_list = [], []
+        reward_list, data_id_list, rollout_id_list, turn_index_list, is_drop_list = [], [], [], [], []
         n_trunc_sample_because_of_response = 0
-        for rollout_id, sample_info in self.finished_id_to_sample_info.items():
-            trace_list = sample_info["trace_list"]
-            reward = sample_info["reward"]
-            for turn_index, trace in enumerate(trace_list):
-                reward_list.append(reward)
-                prompt_ids = trace["prompt_ids"]
-                response_ids = trace["response_ids"]
+
+        for rollout_id, sample_info in finished_id_to_sample_info.items():
+            for turn_index, trace in enumerate(sample_info["trace_list"]):
+                reward_list.append(sample_info["reward"])
+                prompt_ids, response_ids = trace["prompt_ids"], trace["response_ids"]
+
+                # Mark samples with prompts exceeding max_prompt_length to be dropped later
                 if len(prompt_ids) > max_prompt_length:
-                    # mark_as_drop, only drop when max_prompt_length exceeds
                     prompt_ids = prompt_ids[:max_prompt_length]
                     is_drop_list.append(True)
                 else:
                     is_drop_list.append(False)
+
+                # Truncate responses that exceed max_response_length
                 if len(response_ids) > max_response_length:
                     response_ids = response_ids[:max_response_length]
                     n_trunc_sample_because_of_response += 1
-                one_input_ids, one_input_attention_mask = \
-                    get_left_padded_ids_and_attention_mask(
-                        prompt_ids, 
-                        max_prompt_length, 
-                        self.pad_token_id
-                    )
-                one_response_ids, one_response_attention_mask = \
-                    get_right_padded_ids_and_attention_mask(
-                        response_ids, 
-                        max_response_length, 
-                        self.pad_token_id
-                    )
+
+                # Pad prompts to the left and responses to the right
+                one_input_ids, one_input_attention_mask = get_left_padded_ids_and_attention_mask(prompt_ids, max_prompt_length, self.pad_token_id)
+                one_response_ids, one_response_attention_mask = get_right_padded_ids_and_attention_mask(response_ids, max_response_length, self.pad_token_id)
+
                 input_ids_list.append(one_input_ids)
                 input_attention_mask_list.append(one_input_attention_mask)
                 response_ids_list.append(one_response_ids)
                 response_attention_mask_list.append(one_response_attention_mask)
-                data_id_list.append(sample_info['data_id'])
+                data_id_list.append(sample_info["data_id"])
                 rollout_id_list.append(rollout_id)
                 turn_index_list.append(turn_index)
 
@@ -556,31 +595,35 @@ class AgentModeDaemon(object):
         input_attention_mask = torch.LongTensor(input_attention_mask_list).to(device)
         batch_response_ids = torch.LongTensor(response_ids_list).to(device)
         response_attention_mask = torch.LongTensor(response_attention_mask_list).to(device)
+
+        # Concatenate prompts and responses to form the full sequence
         batch_seq = torch.cat([batch_input_ids, batch_response_ids], dim=-1)
         attention_mask = torch.cat([input_attention_mask, response_attention_mask], dim=-1)
-        position_ids = torch.clip(torch.cumsum(attention_mask, dim=-1) - 1, min=0, max=None)
+        position_ids = torch.clamp(torch.cumsum(attention_mask, dim=-1) - 1, min=0)
         is_drop_mask = torch.BoolTensor(is_drop_list).to(device)
         scores = torch.tensor(reward_list, dtype=torch.bfloat16).to(device)
-        token_level_scores = torch.zeros_like(attention_mask, dtype=scores.dtype)  # (bsz, seqlen)
-        # 在每个样本的 eos_mask_idx 位置，把对应的 scores 填进去
-        # torch.arange(batch_size) 生成 [0,1,2,...,bsz-1] 作为 batch 维度的索引
+
+        # Create token-level scores by placing the final reward at the last token position
+        token_level_scores = torch.zeros_like(attention_mask, dtype=scores.dtype)
+        # At the eos_mask_idx position of each sample, fill in the corresponding scores.
+        # torch.arange(n_transition) generates [0,1,2,...,bsz-1] as indices for the batch dimension.
         eos_mask_idx = torch.argmax(position_ids * attention_mask, dim=-1)  # (bsz,)
         token_level_scores[torch.arange(n_transition), eos_mask_idx] = scores
-        # 只取出序列末尾 response_length 那部分，得到模型回答部分的 token-level 分数
+        # Only take the last response_length part of the sequence to get the token-level scores for the model's response part.
         token_level_scores = token_level_scores[:, -max_response_length:]
 
-        # form output
+        # Form the final batch using TensorDict
         batch = TensorDict(
             {
-                'prompts': batch_input_ids,
-                'responses': batch_response_ids,
-                'input_ids': batch_seq,  # here input_ids become the whole sentences
-                'attention_mask': attention_mask,
-                'position_ids': position_ids,
+                "prompts": batch_input_ids,
+                "responses": batch_response_ids,
+                "input_ids": batch_seq,  # here input_ids become the whole sentences
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
                 "is_drop_mask": is_drop_mask,
                 "token_level_scores": token_level_scores.contiguous(),
             },
-            batch_size=n_transition
+            batch_size=n_transition,
         )
         data_proto = DataProto(batch=batch)
 
@@ -589,99 +632,22 @@ class AgentModeDaemon(object):
             "agent_mode/n_sample_to_train": n_transition,
         }
 
+        # Add non-tensor data for advantage calculation and logging
         data_proto.non_tensor_batch["data_id_list"] = np.array(data_id_list)
         data_proto.non_tensor_batch["rollout_id_list"] = np.array(rollout_id_list)
         data_proto.non_tensor_batch["turn_index_list"] = np.array(turn_index_list)
 
         return data_proto, data_metrics
 
-
-    def start(self):
-        app = Flask(__name__)
-
-        @app.route('/')
-        def index():
-            return 'Hello, Flask in Daemon Thread!'
-
-        @app.route('/status', methods=['GET'])
-        def status():
-            # True if there's at least one backend, False otherwise
-            return jsonify(endpoint_status=True if len(self.available_server_addresses) > 0 else False)
-
-        @app.route('/train_information', methods=['GET'])
-        def train_information():
-            # True if there's at least one backend, False otherwise
-            return jsonify(**self.train_information)
-
-        @app.route('/next_data_sample', methods=['GET'])
-        def next_data_sample():
-            # True if there's at least one backend, False otherwise
-            sample_data = self.pick_one_sample()
-            if sample_data is None:
-                return jsonify(is_available=False, data=None)
-            else:
-                return jsonify(is_available=True, data=sample_data)
-
-        @app.route('/report', methods=['POST'])
-        def report():
-            payload = request.get_json(force=True)
-
-            rollout_id = payload['rollout_id']
-            trace_list = payload['trace_list']
-            reward = payload['reward']
-
-            self.report_one_sample(rollout_id, reward, trace_list)
-
-            return jsonify(status='ok', received_id=rollout_id), 200
-
-        @app.route('/v1/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'])
-        def proxy(path):
-            # 随机选择一个后端
-            if len(self.available_server_addresses) == 0:
-                abort(500, description="no backend server configured")
-            target = random.choice(self.available_server_addresses)
-            # 构造完整 URL
-            target_url = f'http://{target}/v1/{path}'
-            print("Redirected to", target_url)
-            # 复制客户端请求头，去掉 Host
-            headers = {
-                key: value
-                for key, value in request.headers.items()
-                if key.lower() != 'host'
-            }
-
-            # 发起转发请求
-            resp = requests.request(
-                method=request.method,
-                url=target_url,
-                headers=headers,
-                params=request.args,
-                data=request.get_data(),
-                cookies=request.cookies,
-                allow_redirects=False
-            )
-
-            # 过滤掉一些 hop-by-hop 头
-            excluded_headers = {
-                'content-encoding', 'content-length', 'transfer-encoding',
-                'connection', 'keep-alive', 'proxy-authenticate',
-                'proxy-authorization', 'te', 'trailers', 'upgrade'
-            }
-            response_headers = [
-                (name, value) for name, value in resp.headers.items()
-                if name.lower() not in excluded_headers
-            ]
-
-            # 返回后端响应给客户端
-            return Response(resp.content, status=resp.status_code, headers=response_headers)
-
-        def _run():
-            app.run(port=self.port, threaded=True, debug=False)
-
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
-        return thread
-
+    def clear_data_and_server(self):
+        """Resets the internal state of the daemon for the next run."""
+        self.backend_llm_server_addresses = []
+        self._completed_rollouts.clear()
+        self._task_id_to_original_sample.clear()
+        self._total_tasks_queued = 0
+        # For a true reset, the server's internal queues would also need clearing.
+        # This implementation assumes that `set_up_data_and_server` is called
+        # for each new run, effectively starting a fresh batch.
 
 
 class RayPPOTrainer:
@@ -993,7 +959,6 @@ class RayPPOTrainer:
         self.agent_mode_daemon.clear_data_and_server()
         self.async_rollout_manager.sleep()
         return test_metrics
-
 
     def _validate(self):
         if self.config.agent_mode.enable is True:
@@ -1339,7 +1304,6 @@ class RayPPOTrainer:
         self.global_steps += 1
         last_val_metrics = None
 
-
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
@@ -1374,10 +1338,7 @@ class RayPPOTrainer:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         elif self.config.agent_mode.enable:
                             self.async_rollout_manager.wake_up()
-                            self.agent_mode_daemon.set_up_data_and_server(
-                                gen_batch.non_tensor_batch,
-                                self.async_rollout_manager.server_addresses
-                            )
+                            self.agent_mode_daemon.set_up_data_and_server(gen_batch.non_tensor_batch, self.async_rollout_manager.server_addresses)
                             self.agent_mode_daemon.run_until_all_finished()
                             batch, agent_metrics = self.agent_mode_daemon.get_train_data_batch(
                                 max_prompt_length=self.config.data.max_prompt_length,
@@ -1470,7 +1431,7 @@ class RayPPOTrainer:
 
                     with _timer("adv", timing_raw):
                         # if agent_mode is enabled, there is already token_level_scores
-                        if not(self.config.agent_mode.enable):
+                        if not (self.config.agent_mode.enable):
                             # we combine with rule-based rm
                             reward_extra_infos_dict: dict[str, list]
                             if self.config.reward_model.launch_reward_fn_async:
@@ -1502,7 +1463,6 @@ class RayPPOTrainer:
                             multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
                         )
 
-
                     # after advantages are assinged, we begin to drop (1) long prompt (2) floor to ppo minisize
                     if self.config.agent_mode.enable:
                         keep_indices = (~batch.batch["is_drop_mask"]).nonzero(as_tuple=True)[0]
@@ -1517,7 +1477,6 @@ class RayPPOTrainer:
                         n_remained_transition = n_transition // mini_batch_size * mini_batch_size
                         batch = batch[list(range(n_remained_transition))]
                         metrics["agent_mode/n_dropped_sample_because_of_mini_batch"] = n_transition - n_remained_transition
-
 
                     # Agent mode note: Change the order of balance batch;
                     #     1. first calculate advantage
