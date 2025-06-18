@@ -1,17 +1,20 @@
 import asyncio
 import random
 import threading
+import time
 import uuid
 from typing import Dict, List, Optional
 
 import numpy as np
 import requests
 import torch
-from agentlightning import LLM, AgentLightningServer, NamedResources, Rollout
+from agentlightning import LLM, AgentLightningServer, NamedResources, Rollout, configure_logger
 from flask import Flask, Response, abort, request
 from tensordict import TensorDict
 
 from verl import DataProto
+
+configure_logger()
 
 
 def get_left_padded_ids_and_attention_mask(ids: List[int], max_length: int, pad_token_id: int):
@@ -110,7 +113,10 @@ class AgentModeDaemon:
         """
         app = Flask(__name__)
 
-        @app.route("/v1/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+        num_requests = 0
+        last_request_time = 0
+
+        @app.route("/v1/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
         def proxy(path):
             if not self.backend_llm_server_addresses:
                 abort(503, description="No backend LLM servers available.")
@@ -121,6 +127,14 @@ class AgentModeDaemon:
 
             # Copy client request headers, removing the Host header
             headers = {key: value for key, value in request.headers if key.lower() != "host"}
+
+            # Log the request for debugging
+            nonlocal num_requests, last_request_time
+            current_time = time.time()
+            num_requests += 1
+            if current_time - last_request_time > 60 or num_requests == 1 or num_requests % 100 == 0:
+                print(f"Proxying {request.method} request to {target_server}. Request data: {request.get_data()}")
+            last_request_time = current_time
 
             try:
                 # Forward the request to the target backend
@@ -135,14 +149,14 @@ class AgentModeDaemon:
                     timeout=self.task_timeout_seconds,
                 )
                 # Filter out hop-by-hop headers before returning the response
-                excluded_headers = ["content-encoding", "content-length", "transfer-encoding", "connection"]
+                excluded_headers = ["content-encoding", "content-length", "transfer-encoding", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "upgrade"]
                 response_headers = [(name, value) for name, value in resp.raw.headers.items() if name.lower() not in excluded_headers]
                 return Response(resp.content, resp.status_code, response_headers)
             except requests.exceptions.RequestException as e:
                 abort(500, description=f"Error proxying request: {e}")
 
         def run_app():
-            app.run(host="0.0.0.0", port=self.proxy_port, threaded=True)
+            app.run(host="0.0.0.0", port=self.proxy_port, threaded=True, debug=False)
 
         self._proxy_thread = threading.Thread(target=run_app, daemon=True)
         self._proxy_thread.start()
@@ -151,10 +165,15 @@ class AgentModeDaemon:
     def start(self):
         """Starts the main AgentLightningServer and the proxy server."""
 
-        asyncio.run(self.server.start())
-        self._start_proxy_server()
+        def run_server():
+            """Run the AgentLightningServer in a separate thread."""
+            asyncio.run(self.server.run_forever())
 
+        self._server_thread = threading.Thread(target=run_server, daemon=True)
+        self._server_thread.start()
         print(f"AgentLightningServer control plane running on port {self.server_port}")
+
+        self._start_proxy_server()
 
     async def _async_set_up(self, data, server_addresses, is_train=True):
         """Async helper to set up data and resources on the server."""
@@ -164,7 +183,7 @@ class AgentModeDaemon:
 
         # 1. Update resources on the server for clients to use
         llm_resource = LLM(
-            endpoint=f"http://127.0.0.1:{self.proxy_port}",
+            endpoint=f"http://127.0.0.1:{self.proxy_port}/v1",
             model=self.train_information.get("model", "default-model"),
             sampling_parameters={"temperature": self.train_information.get("temperature", 0.7)},
         )
@@ -225,7 +244,7 @@ class AgentModeDaemon:
         for rollout_id, rollout in self._completed_rollouts.items():
             if not rollout.triplets:
                 continue
-            response_length_list = [len(triplet.response.get("response_ids", [])) for triplet in rollout.triplets]
+            response_length_list = [len(triplet.response.get("token_ids", [])) for triplet in rollout.triplets]
             sample_stat_list.append(
                 {
                     "sum_response_length": np.sum(response_length_list),
