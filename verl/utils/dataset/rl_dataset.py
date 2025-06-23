@@ -66,6 +66,7 @@ class RLHFDataset(Dataset):
         tokenizer: PreTrainedTokenizer,
         config: DictConfig,
         processor: Optional[ProcessorMixin] = None,
+        agent_mode=False,
     ):
         if not isinstance(data_files, (List, ListConfig)):
             data_files = [data_files]
@@ -92,6 +93,7 @@ class RLHFDataset(Dataset):
         self.need_tools_kwargs = config.get("need_tools_kwargs", False)
         self.filter_prompts = config.get("filter_prompts", True)
         self.serialize_dataset = False
+        self.agent_mode = agent_mode
         self._download()
         self._read_files_and_tokenize()
 
@@ -111,6 +113,9 @@ class RLHFDataset(Dataset):
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 
         print(f"dataset len: {len(self.dataframe)}")
+        
+        if self.agent_mode:
+            return
 
         # filter out too long prompts
         if self.filter_overlong_prompts:
@@ -160,6 +165,16 @@ class RLHFDataset(Dataset):
         Note that we also return the raw_input_ids so that it can be combined with other chat template
         """
         row_dict: dict = self.dataframe[item]
+
+        if self.agent_mode:
+            # add index for each prompt
+            index = row_dict.get("extra_info", {}).get("index", 0)
+            row_dict["index"] = index
+            # Workaround for data proto. At least one tensor is needed.
+            row_dict["fake_ids"] = torch.ones(1, dtype=torch.int)
+            return row_dict
+
+
         messages = self._build_messages(row_dict)
         model_inputs = {}
 
