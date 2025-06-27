@@ -37,6 +37,9 @@ from verl.workers.rollout.async_server import AsyncServerBase
 
 logger = logging.getLogger(__file__)
 
+from agentlightning.instrumentation.vllm import instrument_vllm
+
+instrument_vllm()
 
 class ExternalRayDistributedExecutor(Executor):
     """An executor that engines are launched by external ray actors."""
@@ -221,7 +224,7 @@ class AsyncvLLMServer(AsyncServerBase):
         if request.stream:
             return StreamingResponse(content=generator, media_type="text/event-stream")
         else:
-            assert isinstance(generator, ChatCompletionResponse)
+            # assert isinstance(generator, ChatCompletionResponse)
             return JSONResponse(content=generator.model_dump())
 
     async def generate(self, prompt_ids: List[int], sampling_params: Dict[str, Any], request_id: str) -> List[int]:
