@@ -143,16 +143,14 @@ The setup of training server is the same as the command above.
 
 | Model         | Size   |   Context |   Max Turns | Agents                        |   Acc (Initial) |   Acc (Final) | Transitions   |   Prompt Length | Response Length   |
 |---------------|--------|-----------|-------------|-------------------------------|-----------------|---------------|---------------|-----------------|-------------------|
-| Llama3.2      | 1B     |      2048 |           3 | write&#124;rewrite            |            18.8 |          53   | 2.89 → 3.00   |           800.9 | 299.1 → 15.9      |
-| Llama3.2      | 3B     |      2048 |           3 | write&#124;rewrite            |            53   |          68.2 | 2.26 → 2.52   |           831.5 | 123.8 → 44.8      |
-| Qwen2.5-Coder | 1.5B   |      2048 |           3 | write&#124;rewrite            |            28.6 |          68.8 | 2.74 → 2.99   |           846   | 38.0 → 33.8       |
+| Llama3.2      | 1B     |      2048 |           3 | write&#124;rewrite            |            21   |          49.6 | 2.87 → 3.08   |           821.2 | 319.2 → 249.4     |
+| Llama3.2      | 3B     |      2048 |           3 | write&#124;rewrite            |            51.8 |          66.4 | 2.20 → 2.72   |           865.6 | 116.2 → 314.3     |
+| Qwen2.5-Coder | 1.5B   |      2048 |           3 | write&#124;rewrite            |            39.8 |          68.8 | 2.82 → 3.00   |           849.9 | 38.2 → 62.6       |
 | Qwen2.5-Coder | 3B     |      2048 |           1 | write&#124;rewrite            |            63.8 |          73.2 | 1.00 → 1.00   |           707.9 | 36.9 → 32.8       |
-| Qwen2.5-Coder | 3B     |      2048 |           3 | rewrite&#124;check            |            63.4 |          74   | 2.31 → 1.81   |           967.2 | 22.0 → 52.9       |
-| Qwen2.5-Coder | 3B     |      2048 |           3 | write&#124;rewrite            |            50.8 |          75.2 | 2.02 → 1.78   |           799.9 | 43.9 → 29.1       |
-| Qwen2.5-Coder | 3B     |      2048 |           3 | write&#124;rewrite            |            62.4 |          74.2 | 1.63 → 1.40   |           793.7 | 37.3 → 28.9       |
-| Qwen2.5-Coder | 3B     |      2048 |           3 | write&#124;rewrite&#124;check |            63.4 |          73   | 3.32 → 2.58   |           864.7 | 30.7 → 32.4       |
+| Qwen2.5-Coder | 3B     |      2048 |           3 | write&#124;rewrite            |            63.4 |          76.4 | 1.65 → 1.44   |           792.5 | 37.2 → 29.2       |
+| Qwen2.5-Coder | 3B     |      2048 |           3 | write&#124;rewrite&#124;check |            63.6 |          77.6 | 3.30 → 2.60   |           868.8 | 30.6 → 104.9      |
 | Qwen2.5-Coder | 3B     |      4096 |           1 | write&#124;rewrite            |            68.8 |          80.2 | 1.00 → 1.00   |           974.2 | 36.4 → 31.1       |
-| Qwen2.5-Coder | 3B     |      4096 |           3 | write&#124;rewrite            |            68   |          81.4 | 1.54 → 1.47   |          1052   | 36.7 → 31.3       |
+| Qwen2.5-Coder | 3B     |      4096 |           3 | write&#124;rewrite            |            69.6 |          80.4 | 1.55 → 1.40   |          1046.1 | 36.8 → 31.9       |
 
 **Notes:**
 
@@ -166,18 +164,11 @@ The setup of training server is the same as the command above.
 
 | Model         | Size   |   Context |   Max Turns | Agents                        |   # GPUs |   # Steps |   Time (h) |   Time/Step (s) |   Rollout Time (%) |   Update Actor Time (%) |
 |---------------|--------|-----------|-------------|-------------------------------|----------|-----------|------------|-----------------|--------------------|-------------------------|
-| Llama3.2      | 1B     |      2048 |           3 | write&#124;rewrite            |        1 |       436 |       5.57 |            62.1 |               71.6 |                    21.8 |
-| Llama3.2      | 3B     |      2048 |           3 | write&#124;rewrite            |        4 |       436 |      16.09 |           118.8 |               75.4 |                    19.1 |
-| Qwen2.5-Coder | 1.5B   |      2048 |           3 | write&#124;rewrite            |        1 |       436 |       8.3  |            63.8 |               63.1 |                    28.5 |
+| Llama3.2      | 1B     |      2048 |           3 | write&#124;rewrite            |        1 |       436 |      13.06 |            98.9 |               66.7 |                    25.2 |
+| Llama3.2      | 3B     |      2048 |           3 | write&#124;rewrite            |        2 |       436 |      10.3  |           181.3 |               63.9 |                    27.9 |
+| Qwen2.5-Coder | 1.5B   |      2048 |           3 | write&#124;rewrite            |        1 |       436 |      15.41 |           120.5 |               65.4 |                    26.1 |
 | Qwen2.5-Coder | 3B     |      2048 |           1 | write&#124;rewrite            |        2 |       436 |       6.13 |            47   |               69.1 |                    23.4 |
-| Qwen2.5-Coder | 3B     |      2048 |           3 | rewrite&#124;check            |        2 |       435 |       3.01 |           127.4 |               70.1 |                    22.9 |
-| Qwen2.5-Coder | 3B     |      2048 |           3 | write&#124;rewrite            |        2 |       436 |       9.84 |            76.1 |               66.7 |                    25.3 |
-| Qwen2.5-Coder | 3B     |      2048 |           3 | write&#124;rewrite            |        2 |       436 |       9.59 |            73.7 |               66.7 |                    25.2 |
-| Qwen2.5-Coder | 3B     |      2048 |           3 | write&#124;rewrite&#124;check |        2 |       436 |      12.85 |           100.4 |               56.4 |                    33.5 |
+| Qwen2.5-Coder | 3B     |      2048 |           3 | write&#124;rewrite            |        2 |       436 |       8.58 |            65.2 |               62.3 |                    28.5 |
+| Qwen2.5-Coder | 3B     |      2048 |           3 | write&#124;rewrite&#124;check |        2 |       436 |      16.97 |           133.2 |               42.7 |                    44.2 |
 | Qwen2.5-Coder | 3B     |      4096 |           1 | write&#124;rewrite            |        2 |       436 |       8.5  |            66   |               55.7 |                    34   |
-| Qwen2.5-Coder | 3B     |      4096 |           3 | write&#124;rewrite            |        2 |       436 |       7.38 |            83.1 |               61.8 |                    28.8 |
-
-### Known issues
-
-1. Some experimental runs completed fewer training steps due to technical constraints encountered during the limited training window. These limitations included response length explosion (which significantly slowed training throughput and potentially caused OOMs) and occasional cluster infrastructure failures.
-2. The `execute_query` step is only invoked once in the first turn and not in subsequent turns, which may lead to lower accuracy for agents trained with more than one turn. This is a known bug of the current agent implementation and will be addressed in future iterations.
+| Qwen2.5-Coder | 3B     |      4096 |           3 | write&#124;rewrite            |        2 |       436 |       9.58 |            74.7 |               59.4 |                    30.6 |
