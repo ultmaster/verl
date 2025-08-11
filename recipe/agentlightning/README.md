@@ -1,6 +1,6 @@
-# SQL Agent with Agent Lightning
+# Training AI Agents to Write and Self-correct SQL with Reinforcement Learning
 
-This example demonstrates how to build and train a self-correcting SQL agent. It leverages [Agent Lightning](https://github.com/microsoft/agent-lightning) and the `verl` framework for Reinforcement Learning (RL) based training, and LangGraph to define the agent's complex, cyclical reasoning workflow. The goal is to fine-tune a Large Language Model (LLM) to accurately convert natural language questions into executable SQL queries.
+This post demonstrates how to build and train a self-correcting SQL agent. It leverages [Agent Lightning](https://github.com/microsoft/agent-lightning) and the `verl` framework for Reinforcement Learning (RL) based training, and LangGraph to define the agent's complex, cyclical reasoning workflow. The goal is to fine-tune a Large Language Model (LLM) to accurately convert natural language questions into executable SQL queries.
 
 **The example is tested with verl v0.5.0, vLLM v0.10.0, and Agent Lightning v0.1.1.**
 
@@ -172,3 +172,16 @@ The setup of training server is the same as the command above.
 | Qwen2.5-Coder | 3B     |      2048 |           3 | write&#124;rewrite&#124;check |        2 |       436 |      16.97 |           133.2 |               42.7 |                    44.2 |
 | Qwen2.5-Coder | 3B     |      4096 |           1 | write&#124;rewrite            |        2 |       436 |       8.5  |            66   |               55.7 |                    34   |
 | Qwen2.5-Coder | 3B     |      4096 |           3 | write&#124;rewrite            |        2 |       436 |       9.58 |            74.7 |               59.4 |                    30.6 |
+
+### Key Takeaways
+
+- **RL training consistently boosts accuracy.** Every model improved from initial to final accuracy. Qwen2.5-Coder-3B with 4096 context reached 80.4% at three turns, and 80.2% even at a single turn.
+- **Longer context helps.** Moving Qwen2.5-Coder-3B from 2048 to 4096 context improved final accuracy (76.4% → 80.4% at three turns, 73.2% → 80.2% at one turn).
+- **More turns can help, but not always.** With 2048 context, Qwen2.5-Coder-3B improved from 73.2% at one turn to 76.4% at three turns. At 4096 context, the gain from one to three turns was small (80.2% → 80.4%).
+- **Explicit train the agent to check adds a small accuracy bump with notable cost.** Adding check to training for Qwen2.5-Coder-3B lifted final accuracy from 76.4% to 77.6%, but training time roughly doubled and update time rose, as reflected in the efficiency table.
+- **The agent learns to do more with fewer transitions.** Transitions often drop over training (for example 1.65 → 1.44 and 3.30 → 2.60), suggesting the loop converges faster as policies improve.
+- **Throughput vs quality trade-offs are clear.** If you need faster runs, prefer one turn and a larger context. If peak accuracy matters on constrained context, allow up to three turns.
+
+## Why this matters
+
+Classic supervised finetuning treats SQL generation as a single-shot task. Here, the agent **learns to self-correct** through interaction with the database and the environment, and RL updates the **write** and **rewrite** policies using outcome-based rewards. This closes the loop between intent, execution, feedback, and policy improvement.
